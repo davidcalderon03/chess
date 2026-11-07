@@ -6,8 +6,10 @@ Train and test a small ResNet on the shards written by extract.py.
 
 Prints train/val metrics each epoch, saves the best model (by val loss) to --save,
 then reloads it and reports test accuracy next to two simple baselines.
+Finally it plots the train/val loss curves, saves them to --plot, and shows the figure.
 """
 import argparse
+import os
 import time
 
 import numpy as np
@@ -94,6 +96,36 @@ def baselines(ds, train_ds):
     return acc_major, acc_elo
 
 
+def plot_losses(step_losses, steps_per_epoch, epoch_train, epoch_val, path):
+    """Visualize the per-step train loss (raw + smoothed) and per-epoch train/val loss, x-axis in epochs."""
+    import matplotlib
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    steps = np.asarray(step_losses)
+    x = np.arange(1, len(steps) + 1) / steps_per_epoch
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(x, steps, color="tab:blue", alpha=0.2, linewidth=0.8, label="train (per step)")
+    win = max(1, min(len(steps) // 20, steps_per_epoch))
+    if len(steps) >= win > 1:
+        smooth = np.convolve(steps, np.ones(win) / win, mode="valid")
+        ax.plot(x[win - 1:], smooth, color="tab:blue", linewidth=2, label=f"train (avg of {win} steps)")
+    epochs = np.arange(1, len(epoch_val) + 1)
+    ax.plot(epochs, epoch_train, "s--", color="tab:blue", label="train (epoch mean)")
+    ax.plot(epochs, epoch_val, "o-", color="tab:orange", linewidth=2, label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("cross-entropy loss")
+    ax.set_title("Training loss")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    print(f"\nsaved loss curve to {path}")
+    if matplotlib.get_backend().lower() != "agg":
+        plt.show()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data")
@@ -105,6 +137,7 @@ def main():
     p.add_argument("--use-elo", action="store_true", help="feed both players' ratings to the model")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--save", default="model.pt")
+    p.add_argument("--plot", default="loss_curve.png", help="where to save the loss curve image")
     a = p.parse_args()
 
     device = pick_device()
@@ -131,6 +164,7 @@ def main():
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
     best_val = float("inf")
+    step_losses, epoch_train, epoch_val = [], [], []
     for epoch in range(1, a.epochs + 1):
         model.train()
         t0, run_loss, run_correct, seen = time.time(), 0.0, 0, 0
@@ -145,7 +179,8 @@ def main():
             scaler.update()
             sched.step()
 
-            run_loss += loss.item() * len(y)
+            step_losses.append(loss.item())
+            run_loss += step_losses[-1] * len(y)
             run_correct += (logits.argmax(1) == y).sum().item()
             seen += len(y)
             if step % 200 == 0:
@@ -153,6 +188,8 @@ def main():
                       f"loss {run_loss / seen:.4f} acc {run_correct / seen:.4f}", flush=True)
 
         val_loss, val_acc, val_pc = evaluate(model, val_dl, device)
+        epoch_train.append(run_loss / seen)
+        epoch_val.append(val_loss)
         print(f"epoch {epoch}: train loss {run_loss / seen:.4f} acc {run_correct / seen:.4f} | "
               f"val loss {val_loss:.4f} acc {val_acc:.4f} | {time.time() - t0:.0f}s")
         if val_loss < best_val:
@@ -172,6 +209,8 @@ def main():
     print(f"baseline, higher Elo wins:   {base_elo:.4f}")
     for name, acc in zip(CLASSES, test_pc):
         print(f"  recall on {name:<10} {acc:.4f}")
+
+    plot_losses(step_losses, len(train_dl), epoch_train, epoch_val, a.plot)
 
 
 if __name__ == "__main__":

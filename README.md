@@ -13,7 +13,7 @@ Files:
 ```bash
 conda create -n chess python=3.12 -y
 conda activate chess
-pip install torch numpy python-chess zstandard
+pip install torch numpy python-chess zstandard matplotlib
 ```
 
 ## 2. Get the data
@@ -58,6 +58,8 @@ python train.py --data data --epochs 5 --use-elo   # also feed player ratings to
 ```
 
 The best checkpoint (by validation loss) is saved to `model.pt`. At the end the script reports test accuracy next to two baselines: always predicting the most common class, and predicting that the higher-rated player wins. The model should beat the Elo baseline to be learning something from the board.
+
+Finally it plots the loss curves (per-step and smoothed train loss, plus per-epoch train and val loss), saves the figure to `loss_curve.png` (change with `--plot`), and opens it in a window if a display is available.
 
 ## Notes
 
