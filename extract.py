@@ -172,7 +172,17 @@ def main():
     p.add_argument("--history", type=int, default=8, help="previous positions stored per sample")
     p.add_argument("--shard-size", type=int, default=500_000)
     p.add_argument("--overwrite", action="store_true", help="delete existing shards in --out first")
+    p.add_argument("--tasks", choices=("outcome", "all"), default="outcome")
+    p.add_argument("--engine", help="Stockfish executable, required for --tasks all")
+    p.add_argument("--engine-nodes", type=int, default=100_000,
+                   help="fixed search budget per engine analysis used for mistake labels")
+    p.add_argument("--mistake-threshold", type=float, default=.10,
+                   help="positive mistake if engine expected-score loss exceeds this value")
     a = p.parse_args()
+    if a.tasks == "all":
+        from multitask_data import extract_multitask
+        extract_multitask(a)
+        return
 
     writer = ShardWriter(a.out, a.shard_size, a.overwrite)
     Builder = make_builder(a)

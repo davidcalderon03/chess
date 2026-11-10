@@ -1,0 +1,6 @@
+# Versions used for local verification. Follow PyTorch's instructions for CUDA.
+numpy==2.0.2
+torch==2.8.0
+python-chess==1.999
+zstandard==0.25.0
+matplotlib==3.9.4

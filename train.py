@@ -98,7 +98,7 @@ def baselines(ds, train_ds):
     return acc_major, acc_elo
 
 
-def plot_losses(step_losses, steps_per_epoch, epoch_train, epoch_val, path, show=True, title="Training loss"):
+def plot_losses(step_losses, steps_per_epoch, epoch_train, epoch_val, path, show=True, title="Training loss", quiet=False):
     """Visualize the per-step train loss (raw + smoothed) and per-epoch train/val loss, x-axis in epochs."""
     import matplotlib
     if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
@@ -123,7 +123,8 @@ def plot_losses(step_losses, steps_per_epoch, epoch_train, epoch_val, path, show
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=120)
-    print(f"\nsaved loss curve to {path}")
+    if not quiet:
+        print(f"\nsaved loss curve to {path}")
     if show and matplotlib.get_backend().lower() != "agg":
         plt.show()
     plt.close(fig)
@@ -146,6 +147,18 @@ def parse_args(argv=None):
     p.add_argument("--save", default="model.pt")
     p.add_argument("--plot", default="loss_curve.png", help="where to save the loss curve image")
     p.add_argument("--no-show", action="store_true", help="save the loss curve without opening a window")
+    p.add_argument("--tasks", choices=("outcome", "all"), default="outcome",
+                   help="all trains the five heads; requires shards extracted with --tasks all")
+    p.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
+    p.add_argument("--task-weights", type=float, nargs=5, default=[1., .5, .25, .25, .1],
+                   metavar=("OUTCOME", "MISTAKE", "MOVES", "TIME", "ENDING"))
+    p.add_argument("--huber-delta", type=float, default=1.)
+    p.add_argument("--select-by", choices=("outcome", "total"), default="outcome",
+                   help="validation criterion for five-task checkpoint selection")
+    p.add_argument("--skip-test", action="store_true",
+                   help="reserve test evaluation for evaluate.py after model selection")
+    p.add_argument("--quiet", action="store_true",
+                   help="suppress progress messages; files are still saved and errors/warnings remain visible")
     a = p.parse_args(argv)
     if a.use_elo:
         a.features += "+skill"
@@ -161,28 +174,42 @@ def seed_everything(seed):
 
 def run(a):
     """Train, test, plot. Returns a dict of test metrics and loss curves."""
+    if getattr(a, "tasks", "outcome") == "all":
+        from multitask_training import run_five_task
+        return run_five_task(a)
+    quiet = getattr(a, "quiet", False)
+
+    def log(message):
+        if not quiet:
+            print(message, flush=True)
+
     seed_everything(a.seed)
-    device = pick_device()
+    device = pick_device() if getattr(a, "device", "auto") == "auto" else torch.device(a.device)
     features = parse_features(a.features)
-    print(f"device: {device}  features: {a.features}  seed: {a.seed}")
+    log(f"device: {device}  features: {a.features}  seed: {a.seed}")
 
     ds_kw = dict(features=features, history=a.history)
     train_ds = LichessPositions(a.data, "train", **ds_kw)
     val_ds = LichessPositions(a.data, "val", **ds_kw)
-    test_ds = LichessPositions(a.data, "test", **ds_kw)
-    print(f"positions: train {len(train_ds):,}  val {len(val_ds):,}  test {len(test_ds):,}")
+    test_ds = None if getattr(a, "skip_test", False) else LichessPositions(a.data, "test", **ds_kw)
+    log(f"positions: train {len(train_ds):,}  val {len(val_ds):,}")
+    if not len(train_ds) or not len(val_ds) or a.epochs < 1:
+        raise ValueError("Need nonempty train/validation partitions and --epochs >= 1")
+    from pathlib import Path
+    Path(a.save).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.plot).parent.mkdir(parents=True, exist_ok=True)
 
     kw = dict(batch_size=a.batch_size, num_workers=a.workers, pin_memory=device.type == "cuda",
               persistent_workers=a.workers > 0)
-    train_dl = DataLoader(train_ds, shuffle=True, drop_last=True,
+    train_dl = DataLoader(train_ds, shuffle=True, drop_last=False,
                           generator=torch.Generator().manual_seed(a.seed), **kw)
     val_dl = DataLoader(val_ds, **kw)
-    test_dl = DataLoader(test_ds, **kw)
+    test_dl = DataLoader(test_ds, **kw) if test_ds is not None else None
 
     model = ChessNet(in_ch=train_ds.in_channels, ch=a.channels, blocks=a.blocks,
                      n_scalar=train_ds.n_scalar).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"parameters: {n_params:,}  input planes: {train_ds.in_channels}  "
+    log(f"parameters: {n_params:,}  input planes: {train_ds.in_channels}  "
           f"scalar features: {train_ds.n_scalar}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
@@ -212,35 +239,38 @@ def run(a):
             run_correct += (logits.argmax(1) == y).sum().item()
             seen += len(y)
             if step % 200 == 0:
-                print(f"  epoch {epoch} step {step}/{len(train_dl)} "
-                      f"loss {run_loss / seen:.4f} acc {run_correct / seen:.4f}", flush=True)
+                log(f"  epoch {epoch} step {step}/{len(train_dl)} "
+                    f"loss {run_loss / seen:.4f} acc {run_correct / seen:.4f}")
 
         val_loss, val_acc, val_pc = evaluate(model, val_dl, device)
         epoch_train.append(run_loss / seen)
         epoch_val.append(val_loss)
-        print(f"epoch {epoch}: train loss {run_loss / seen:.4f} acc {run_correct / seen:.4f} | "
+        log(f"epoch {epoch}: train loss {run_loss / seen:.4f} acc {run_correct / seen:.4f} | "
               f"val loss {val_loss:.4f} acc {val_acc:.4f} | {time.time() - t0:.0f}s")
         if val_loss < best_val:
             best_val, best_epoch = val_loss, epoch
-            torch.save({"model": model.state_dict(), "args": vars(a)}, a.save)
-            print(f"  saved best model to {a.save}")
+            torch.save({"model": model.state_dict(), "args": vars(a),
+                        "model_type": "outcome", "best_epoch": best_epoch,
+                        "best_val_loss": best_val}, a.save)
+            log(f"  saved best model to {a.save}")
 
     # Final test with the best checkpoint
-    ckpt = torch.load(a.save, map_location=device)
+    ckpt = torch.load(a.save, map_location=device, weights_only=True)
+    ckpt["training_history"] = {"epoch_train": epoch_train, "epoch_val": epoch_val}
+    torch.save(ckpt, a.save)
     model.load_state_dict(ckpt["model"])
-    test_loss, test_acc, test_pc = evaluate(model, test_dl, device)
-    base_major, base_elo = baselines(test_ds, train_ds)
-
-    print("\n=== TEST RESULTS ===")
-    print(f"features:                    {a.features}")
-    print(f"model accuracy:              {test_acc:.4f}  (loss {test_loss:.4f})")
-    print(f"baseline, majority class:    {base_major:.4f}")
-    print(f"baseline, higher Elo wins:   {base_elo:.4f}")
-    for name, acc in zip(CLASSES, test_pc):
-        print(f"  recall on {name:<10} {acc:.4f}")
+    test_loss = test_acc = base_major = base_elo = None
+    test_pc = [None] * 3
+    if test_dl is not None:
+        test_loss, test_acc, test_pc = evaluate(model, test_dl, device)
+        base_major, base_elo = baselines(test_ds, train_ds)
+        log(f"test: categorical cross-entropy {test_loss:.4f}; accuracy {test_acc:.4f}")
+        log(f"baselines: majority accuracy {base_major:.4f}; higher Elo accuracy {base_elo:.4f}")
+        for name, acc in zip(CLASSES, test_pc):
+            log(f"  recall on {name:<10} {acc:.4f}")
 
     plot_losses(step_losses, len(train_dl), epoch_train, epoch_val, a.plot,
-                show=not a.no_show, title=f"Training loss ({a.features})")
+                show=not a.no_show, title=f"Training loss ({a.features})", quiet=quiet)
 
     return {
         "features": a.features, "seed": a.seed, "params": n_params,
