@@ -8,13 +8,18 @@ Files:
 - `dataset.py` is the PyTorch `Dataset` that reads those shards
 - `train.py` trains and tests a small ResNet on a chosen feature set
 - `ablate.py` runs feature ablations (board, + skill, + time, + history) and compares them
+- `multitask_data.py`, `multitask_model.py`, and `multitask_training.py` provide five-task labels, heads/loss, and training
+- `evaluate.py` reports the five held-out losses and their weighted total
+- `model_io.py` restores checkpoints and the matching board/context encoding
+- `scoring.py` and `score_position.py` calculate engine–human difficulty gaps for individual positions
+- `requirements.txt` lists the Python dependencies; `tests/` contains optional unit tests
 
 ## 1. Setup
 
 ```bash
 conda create -n chess python=3.12 -y
 conda activate chess
-pip install torch numpy python-chess zstandard matplotlib
+python -m pip install -r requirements.txt
 ```
 
 ## 2. Get the data
@@ -22,7 +27,7 @@ pip install torch numpy python-chess zstandard matplotlib
 Lichess publishes one file per month. Start with an old month (small and quick); recent months are tens of GB. Check the site for available months.
 
 ```bash
-wget -c https://database.lichess.org/standard/lichess_db_standard_rated_2026-08.pgn.zst
+curl -L -C - -O https://database.lichess.org/standard/lichess_db_standard_rated_2026-08.pgn.zst
 ```
 
 Do not decompress it. `extract.py` reads the `.zst` directly.
@@ -96,6 +101,56 @@ Outputs in `--out` (default `ablations/`):
 - A checkpoint and loss curve per run.
 
 Compare configs by test cross-entropy, not accuracy. A feature that mostly sharpens the model's confidence can lower the loss a lot while barely moving accuracy. Use at least 3 seeds before reading much into small differences. Cumulative order also matters: what `time` adds after `skill` can differ from what it adds alone, so add configs like `board+time` to check.
+
+## 6. Five-task training and evaluation
+
+The commands above still train outcome-only models by default. To train all five tasks, replay your source `.pgn.zst` into a **new** directory: existing outcome-only shards do not contain the other labels. Five-task extraction also requires a Stockfish executable with native `UCI_ShowWDL` support; substitute your archive and engine paths below.
+
+Install Stockfish separately from the Python dependencies. On macOS with [Homebrew](https://brew.sh/):
+
+```bash
+brew install stockfish
+command -v stockfish
+```
+
+Use the path printed by the second command for `--engine`, or use `--engine stockfish` when it is on your PATH. See the [Homebrew package](https://formulae.brew.sh/formula/stockfish). Without Homebrew, or on Windows/Linux, download and extract the executable for your platform from the [official Stockfish downloads](https://stockfishchess.org/download/), then pass its full path to `--engine`.
+
+```bash
+python extract.py /path/to/games.pgn.zst --tasks all \
+  --out data_five --max-games 1000 --positions-per-game 2 \
+  --engine /path/to/stockfish --engine-nodes 100000
+python train.py --data data_five --tasks all --features board+skill+time \
+  --epochs 5 --batch-size 128 --channels 64 --blocks 3 --workers 0 \
+  --save checkpoints/five_seed0.pt --plot reports/five_training.png \
+  --no-show --skip-test
+python evaluate.py --checkpoint checkpoints/five_seed0.pt --data data_five \
+  --split test --out reports/five_test
+open reports/five_test/report.html
+```
+
+The tasks are final outcome, next-move mistake, remaining plies, next-move seconds, and ending category. The objective is outcome categorical cross-entropy (CCE) + 0.50 × mistake binary cross-entropy (BCE) + 0.25 × length Huber + 0.25 × time Huber + 0.10 × ending CCE. Regression targets use training-only standardized `log1p` transforms; unavailable labels are masked. Ending categories are **checkmate / time forfeit / other normal ending**; PGN `Normal` does not reliably identify resignation.
+
+`--skip-test` reserves test games for `evaluate.py`. The best five-task checkpoint is selected by validation outcome CCE by default, and stores all five heads plus normalization, loss settings, dataset identity, and training history. Use a new checkpoint path for each five-task run.
+
+Training prints one compact row per epoch; full task losses and counts are saved in `<checkpoint>.history.json`. Add `--quiet` to suppress progress output. `--no-show` saves the curves without opening a plot window. A 1,000-game pilot has only about 2,000 positions, so training can finish in seconds on a GPU.
+
+The evaluator uses the same five losses as training: outcome CCE, mistake BCE, remaining-length Huber, thinking-time Huber, and termination CCE. It averages each loss over valid held-out labels and reports their weighted total. Regression normalization and loss settings come from the checkpoint. Results are saved as `metrics.json`, `metrics.csv`, and a simple `report.html` table. Add `--quiet` to suppress terminal output.
+
+Existing outcome-only checkpoints can also be evaluated:
+
+```bash
+python evaluate.py --checkpoint model.pt --data data --out reports/outcome
+```
+
+Use `score_position.py --help` for individual-position human/engine comparisons. Difficulty is a derived engine–human probability gap; prediction metrics compare the model with observed human labels.
+
+The longer step-by-step explanation is in [docs/TRAINING_AND_EVALUATION.md](docs/TRAINING_AND_EVALUATION.md).
+
+Optional unit tests check label alignment, masks, loss formulas, and checkpoint compatibility. Training and evaluation do not run these tests:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
 
 ## Notes
 
