@@ -1,0 +1,8 @@
+# local environment, downloads and large/regenerable outputs: never commit
+.venv/
+bin/
+data_cache/
+results/
+__pycache__/
+.pytest_cache/
+*.pyc
