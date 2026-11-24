@@ -12,6 +12,7 @@ Files:
 - `evaluate.py` reports the five held-out losses and their weighted total
 - `model_io.py` restores checkpoints and the matching board/context encoding
 - `scoring.py` and `score_position.py` calculate engine–human difficulty gaps for individual positions
+- `bot_baselines.py` compares the five-task model with no-information, Elo, hand-built-feature, Stockfish and (optionally) Maia-2 baselines
 - `requirements.txt` lists the Python dependencies; `tests/` contains optional unit tests
 
 ## 1. Setup
@@ -125,8 +126,10 @@ python train.py --data data_five --tasks all --features board+skill+time \
   --no-show --skip-test
 python evaluate.py --checkpoint checkpoints/five_seed0.pt --data data_five \
   --split test --out reports/five_test
-open reports/five_test/report.html
+open reports/five_test/report.html      # macOS; on Linux use xdg-open
 ```
+
+Five-task extraction runs Stockfish on every sampled position in a single process, so it is slow: about 5 positions per second at `--engine-nodes 100000` (50,000 games × 2 positions took about 2.5 hours). It is all-or-nothing: interrupting it (including Ctrl+C) deletes every shard it has written, and there is no option to resume. Run long extractions detached, e.g. `nohup python extract.py ... > extract_five.log 2>&1 &`.
 
 The tasks are final outcome, next-move mistake, remaining plies, next-move seconds, and ending category. The objective is outcome categorical cross-entropy (CCE) + 0.50 × mistake binary cross-entropy (BCE) + 0.25 × length Huber + 0.25 × time Huber + 0.10 × ending CCE. Regression targets use training-only standardized `log1p` transforms; unavailable labels are masked. Ending categories are **checkmate / time forfeit / other normal ending**; PGN `Normal` does not reliably identify resignation.
 
@@ -152,9 +155,63 @@ Optional unit tests check label alignment, masks, loss formulas, and checkpoint 
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
+## 7. Baselines
+
+A model that ignores the position and always predicts the training-set averages is a weak comparison: almost anything beats it. `bot_baselines.py` fits stronger baselines on the train split and scores them on the test split with the same five losses as `evaluate.py`, so they can sit in one table with the model:
+
+```bash
+python bot_baselines.py --data data_five --model-metrics reports/five_test/metrics.json \
+  --out reports/baselines
+```
+
+| Row | Inputs | Tasks |
+|---|---|---|
+| No information | Intercept only: class frequencies or mean target | All |
+| Elo only | Both players' ratings | All |
+| Hand-built features | Ratings, clocks, time control, move number, material, side to move | All |
+| Stockfish, calibrated | Stockfish's expected score for the position | Outcome, mistake |
+| Stockfish + hand-built | Stockfish's expected score plus the hand-built features | All |
+| Maia-2, calibrated (optional) | Maia-2's value and move-policy confidence at the players' ratings | Outcome, mistake |
+| Our model | Read from `--model-metrics` | All |
+
+Classification tasks use (multinomial) logistic regression and the regression tasks a linear model on the same standardized `log1p` target as training. "Calibrated" means a logistic regression maps the bot's raw output to the task's labels; without it, Stockfish's engine-play probabilities are far too confident for human games, which would make it look worse than it is. The Stockfish values come from the five-task shards (`extract.py --tasks all` stores them for the mistake labels), so no engine runs are needed and the script takes seconds.
+
+It writes `metrics.json`, `metrics.csv`, and `table.tex` (a LaTeX `tabular` with the best value per column in bold) to `--out`.
+
+Maia-2 (`--maia2 rapid` or `--maia2 blitz`) needs the `maia2` package. It pins `torch<2.9`, so install it without letting pip change your torch:
+
+```bash
+pip install --no-deps maia2 && pip install einops gdown pandas pyyaml pyzstd tqdm
+python bot_baselines.py --data data_five --model-metrics reports/five_test/metrics.json --maia2 rapid
+```
+
+Its weights download from Google Drive on first use, into `maia2_models/`. Maia-2 is calibrated on `--maia2-train` training positions (default 20,000).
+
+### Reference results
+
+These are the results of the commands in section 6 and above. The data is 50,000 games from `lichess_db_standard_rated_2026-08.pgn.zst`, 2 positions per game, labelled with Stockfish 19 at 100,000 nodes: 90,021 train, 5,005 validation and 4,923 test positions. The model is `--features board+skill+time`, trained for 5 epochs with seed 0.
+
+Test-set losses (lower is better; "---" = the baseline does not cover that task):
+
+| Model | Outcome CCE | Mistake BCE | Length Huber | Time Huber | Termination CCE | Weighted total |
+|---|---|---|---|---|---|---|
+| Valid labels | 4,923 | 4,870 | 4,923 | 4,922 | 4,923 | |
+| No information | 0.8480 | 0.4447 | 0.4329 | 0.4209 | 1.0013 | 1.3839 |
+| Elo only | 0.8351 | 0.4444 | 0.4314 | 0.4163 | 0.9950 | 1.3687 |
+| Hand-built features | 0.7642 | 0.4296 | 0.4024 | 0.3772 | 0.9256 | 1.2664 |
+| Stockfish, calibrated | 0.7811 | 0.4189 | --- | --- | --- | --- |
+| Stockfish + hand-built | **0.7320** | **0.4108** | 0.4019 | 0.3726 | **0.9254** | **1.2236** |
+| Our model | 0.7800 | 0.4163 | **0.3847** | **0.3719** | 0.9793 | 1.2752 |
+
+The weighted total uses the training weights (outcome 1.0, mistake 0.5, length 0.25, time 0.25, termination 0.1).
+
+At this data size, the model beats every baseline on remaining length and thinking time. Simple logistic regressions beat it on outcome and termination, and Stockfish + hand-built features beats it on the mistake task too. The model trained on only 90,021 positions; earlier outcome-only models trained on about 6.3 million positions reached an outcome loss of 0.71–0.75. More training data is the first thing to try before reading much into the comparison.
+
+A rerun from a fresh extraction should give the same baseline numbers: the data, the Stockfish labels and the baseline fits are deterministic. Training on the GPU may differ in the last decimal places.
+
 ## Notes
 
 - Use at least ~100k games, or the val/test splits may be too small.
 - `dataset.py` loads all shards into RAM, which is fine for a few million positions.
-- Stockfish evals in the PGN are ignored by `extract.py`.
+- The Lichess `[%eval]` comments in the PGN are not used. Five-task extraction runs its own Stockfish searches instead.
 - Clocks partly encode how the game ends: a player near zero often loses on time ("Time forfeit" games are kept). That is real signal, but it is part of what the `time` feature measures.
