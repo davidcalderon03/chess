@@ -139,6 +139,40 @@ def _finish(totals, weights):
                                for name, c, n in zip(OUTCOME_CLASSES, totals["correct"], totals["support"])}}
 
 
+def color_flip(board, scalars, outcome, features):
+    """Swap colours and mirror the ranks (python-chess Board.mirror()): an exact symmetry of chess.
+
+    Board planes (see dataset.py): 0-5 white pieces, 6-11 black pieces, 12 white-to-move,
+    13-16 castling [wK, wQ, bK, bQ], 17 en-passant file, then 12 piece planes per history
+    position. Rows are ranks, so mirroring flips dim -2. Scalars: skill [white, black] Elo, then
+    time [white, black] clock fraction, [white, black] log clock, log base, increment.
+    Outcome labels swap white win (0) and black win (2). The other four labels are about the
+    player to move or the game as a whole, so they do not change.
+    """
+    order = list(range(6, 12)) + list(range(6)) + [12, 15, 16, 13, 14, 17]
+    for start in range(18, board.shape[1], 12):
+        order += list(range(start + 6, start + 12)) + list(range(start, start + 6))
+    flipped = board.flip(-2)[:, order]
+    flipped[:, 12] = 1 - flipped[:, 12]
+    swapped = scalars.clone()
+    k = 0
+    if "skill" in features:
+        swapped[:, [0, 1]] = scalars[:, [1, 0]]
+        k = 2
+    if "time" in features:
+        swapped[:, [k, k + 1, k + 2, k + 3]] = scalars[:, [k + 1, k, k + 3, k + 2]]
+    return flipped, swapped, 2 - outcome
+
+
+def augment_batch(board, scalars, targets, features):
+    """Replace a random half of the batch with its color-flipped equivalent."""
+    flip = torch.rand(len(board), device=board.device) < 0.5
+    fb, fs, fo = color_flip(board, scalars, targets["outcome"], features)
+    board = torch.where(flip[:, None, None, None], fb, board)
+    scalars = torch.where(flip[:, None], fs, scalars)
+    return board, scalars, {**targets, "outcome": torch.where(flip, fo, targets["outcome"])}
+
+
 def _to_device(batch, device):
     board, scalars, targets, masks = batch
     return (board.to(device, non_blocking=True), scalars.to(device, non_blocking=True),
@@ -318,6 +352,8 @@ def run_five_task(a):
         totals = _empty_totals()
         for batch in train_loader:
             board, scalars, targets, masks = _to_device(batch, device)
+            if getattr(a, "augment", False):
+                board, scalars, targets = augment_batch(board, scalars, targets, features)
             optimizer.zero_grad(set_to_none=True)
             context = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
             with context:

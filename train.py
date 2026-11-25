@@ -35,10 +35,13 @@ class ResBlock(nn.Module):
         self.b1 = nn.BatchNorm2d(ch)
         self.c2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
         self.b2 = nn.BatchNorm2d(ch)
+        self.c3 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.b3 = nn.BatchNorm2d(ch)        
 
     def forward(self, x):
         h = F.relu(self.b1(self.c1(x)))
         h = self.b2(self.c2(h))
+        h = self.b3(self.c3(h))
         return F.relu(x + h)
 
 
@@ -159,7 +162,12 @@ def parse_args(argv=None):
                    help="reserve test evaluation for evaluate.py after model selection")
     p.add_argument("--quiet", action="store_true",
                    help="suppress progress messages; files are still saved and errors/warnings remain visible")
+    p.add_argument("--augment", action="store_true",
+                   help="colour-flip augmentation (five-task training): each training position is "
+                        "randomly replaced by its colour-swapped, rank-mirrored equivalent")
     a = p.parse_args(argv)
+    if a.augment and a.tasks != "all":
+        p.error("--augment is only implemented for --tasks all")
     if a.use_elo:
         a.features += "+skill"
     a.features = "+".join(parse_features(a.features))
