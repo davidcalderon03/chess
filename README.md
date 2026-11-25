@@ -54,6 +54,8 @@ Useful options:
 | `--min-tc` | 180 | Minimum base + 40 x increment (seconds); drops bullet |
 | `--history` | 8 | Previous positions stored per sample (for the `history` feature) |
 
+A game is discarded if either player is rated below 1200 (`--min-elo`), if it is bullet (base time + 40 × increment under 180 seconds, `--min-tc`), if it was abandoned or has no normal result, if it has no clock times, or if it is too short to sample from. With `--tasks all`, games played by bots are discarded too.
+
 Sanity check:
 
 ```bash
@@ -82,6 +84,12 @@ python train.py --data data --epochs 5 --features board+skill+time+history
 The best checkpoint (by validation loss) is saved to `model.pt`. At the end the script reports test accuracy next to two baselines: always predicting the most common class, and predicting that the higher-rated player wins. The model should beat the Elo baseline to be learning something from the board.
 
 Finally it plots the loss curves (per-step and smoothed train loss, plus per-epoch train and val loss), saves the figure to `loss_curve.png` (change with `--plot`), and opens it in a window if a display is available.
+
+Output flags:
+
+- `--save PATH` (default `model.pt`): where the best checkpoint is written; `evaluate.py` and `score_position.py` read it. Use a new path for each run, or it is overwritten.
+- `--plot PATH` (default `loss_curve.png`): where the loss-curve image is saved. It is always saved.
+- `--no-show`: don't open the plot in a window. Use it with `nohup`, over SSH, or in scripts, so the run doesn't wait for the window to close.
 
 ## 5. Ablations
 

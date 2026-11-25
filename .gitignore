@@ -1,6 +1,15 @@
 /data*
 /reports
+/syzygy
 /__pycache__
 /checkpoints
 *.pt
 *.png
+difficulty_endgame.npz
+difficulty_test.npz
+validate_puzzles.json
+validate_tablebase.json
+validate_think.json
+stockfish
+extract.log
+cache.db
