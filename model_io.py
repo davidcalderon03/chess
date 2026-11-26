@@ -21,38 +21,90 @@ def checkpoint_sha256(path):
 
 
 def load_checkpoint(path, device="cpu"):
-    """Return (eval-mode model, checkpoint), never enabling unsafe pickle loading.
+    """Safely load a checkpoint, including older two-convolution residual blocks."""
+    saved = torch.load(path, map_location="cpu", weights_only=True)
+    return reconstruct_checkpoint(saved, device)
 
-    Architecture dimensions are inferred from tensor shapes. Saved feature names
-    are checked against those shapes; shape alone distinguishes current scalar
-    layouts (0=board, 2=skill, 6=time, 8=skill+time).
+
+def reconstruct_checkpoint(saved, device="cpu"):
+    """Reconstruct an already safely loaded checkpoint from its actual tensor shapes.
+
+    Architecture metadata is validated when present. Older checkpoints need no
+    new metadata: c1/c2 versus c1/c2/c3 keys identify block depth, and convolution
+    weight shapes identify kernel size. Dropout has no weights and falls back to
+    its historical value, 0.2, when it was not saved.
     """
-    saved = torch.load(path, map_location=device, weights_only=True)
     if not isinstance(saved, dict) or not isinstance(saved.get("model"), dict):
         raise ValueError("checkpoint must contain a model state dictionary")
     args = saved.get("args", {})
     if not isinstance(args, dict):
         raise ValueError("checkpoint args must be a plain dictionary")
     state = saved["model"]
+    architecture = saved.get("architecture", {})
+    if not isinstance(architecture, dict):
+        raise ValueError("checkpoint architecture must be a plain dictionary")
     five_task = "heads.outcome.weight" in state
     declared = saved.get("model_type")
     if declared not in (None, "outcome", "single_task", "five_task"):
         raise ValueError(f"unsupported checkpoint model_type: {declared}")
     if declared == "five_task" and not five_task:
         raise ValueError("five_task checkpoint is missing its output heads")
+    if five_task and declared in ("outcome", "single_task"):
+        raise ValueError("checkpoint model_type disagrees with its five-task heads")
     prefix = "backbone." if five_task else ""
     required = [prefix + key for key in ("stem.0.weight", "squeeze.0.weight", "fc.0.weight")]
     if any(key not in state for key in required):
         raise ValueError("checkpoint does not match the repository ChessNet architecture")
-    channels, in_ch = map(int, state[prefix + "stem.0.weight"].shape[:2])
-    squeeze = int(state[prefix + "squeeze.0.weight"].shape[0])
-    n_scalar = int(state[prefix + "fc.0.weight"].shape[1]) - squeeze * 64
+    stem = state[prefix + "stem.0.weight"]
+    squeeze_weight = state[prefix + "squeeze.0.weight"]
+    shared_weight = state[prefix + "fc.0.weight"]
+    if not all(isinstance(t, torch.Tensor) for t in (stem, squeeze_weight, shared_weight)):
+        raise ValueError("checkpoint architecture weights must be tensors")
+    if stem.ndim != 4 or stem.shape[2] != stem.shape[3] or stem.shape[2] % 2 != 1:
+        raise ValueError("checkpoint stem must use a positive odd square convolution kernel")
+    channels, in_ch = map(int, stem.shape[:2])
+    kernel_size = int(stem.shape[2])
+    if tuple(squeeze_weight.shape) != (32, channels, 1, 1) or shared_weight.ndim != 2 or shared_weight.shape[0] != 256:
+        raise ValueError("checkpoint supports a 32-channel squeeze and a 256-unit shared dense layer only")
+    n_scalar = int(shared_weight.shape[1]) - 32 * 64
     if in_ch < 18 or (in_ch - 18) % 12 or n_scalar not in (0, 2, 6, 8):
         raise ValueError("checkpoint has an unsupported board/scalar feature layout")
     history = (in_ch - 18) // 12
     pattern = re.compile(r"^" + re.escape(prefix) + r"blocks\.(\d+)\.")
-    indices = [int(match.group(1)) for key in state if (match := pattern.match(key))]
+    indices = {int(match.group(1)) for key in state if (match := pattern.match(key))}
     blocks = max(indices) + 1 if indices else 0
+    if indices != set(range(blocks)):
+        raise ValueError("checkpoint residual block indices must be contiguous")
+    conv_pattern = re.compile(r"^" + re.escape(prefix) + r"blocks\.(\d+)\.c(\d+)\.weight$")
+    per_block = {i: set() for i in range(blocks)}
+    for key, weight in state.items():
+        match = conv_pattern.match(key)
+        if match:
+            index, convolution = map(int, match.groups())
+            per_block[index].add(convolution)
+            if tuple(weight.shape) != (channels, channels, kernel_size, kernel_size):
+                raise ValueError("checkpoint stem and residual convolution kernels/channels disagree")
+    layouts = set(tuple(sorted(v)) for v in per_block.values())
+    if layouts and (len(layouts) != 1 or next(iter(layouts)) not in ((1, 2), (1, 2, 3))):
+        raise ValueError("checkpoint residual blocks must consistently contain two or three convolutions")
+    convs_per_block = len(next(iter(layouts))) if layouts else int(architecture.get("convs_per_block", args.get("convs_per_block", 3)))
+    if convs_per_block not in (2, 3):
+        raise ValueError("checkpoint convs_per_block must be 2 or 3")
+    inferred = {"channels": channels, "blocks": blocks, "in_ch": in_ch,
+                "n_scalar": n_scalar, "kernel_size": kernel_size, "convs_per_block": convs_per_block}
+    for container_name, container in (("architecture", architecture), ("args", args)):
+        for key, actual in inferred.items():
+            if key in container and container[key] is not None and container[key] != actual:
+                raise ValueError(f"checkpoint {container_name}.{key}={container[key]!r} disagrees with tensor-inferred {actual}")
+    dropout = architecture.get("dropout", args.get("dropout", .2))
+    try:
+        dropout = float(dropout)
+    except (TypeError, ValueError) as error:
+        raise ValueError("checkpoint dropout must be a finite probability") from error
+    if not np.isfinite(dropout) or not 0 <= dropout <= 1:
+        raise ValueError("checkpoint dropout must lie in [0, 1]")
+    if "dropout" in architecture and "dropout" in args and architecture["dropout"] != args["dropout"]:
+        raise ValueError("checkpoint architecture.dropout and args.dropout disagree")
     spec = saved.get("features", args.get("features"))
     if spec is None:
         inferred = {0: "board", 2: "board+skill", 6: "board+time", 8: "board+skill+time"}[n_scalar]
@@ -69,17 +121,25 @@ def load_checkpoint(path, device="cpu"):
         from multitask_model import MultiTaskChessNet
 
         n_termination = int(state["heads.termination.weight"].shape[0])
-        model = MultiTaskChessNet(in_ch, channels, blocks, n_scalar, n_termination)
+        model = MultiTaskChessNet(in_ch, channels, blocks, n_scalar, n_termination,
+                                 dropout=dropout, convs_per_block=convs_per_block, kernel_size=kernel_size)
     else:
         from train import ChessNet
 
         n_termination = None
-        model = ChessNet(in_ch=in_ch, ch=channels, blocks=blocks, n_scalar=n_scalar)
-    model.load_state_dict(state, strict=True)
+        model = ChessNet(in_ch=in_ch, ch=channels, blocks=blocks, n_scalar=n_scalar,
+                         dropout=dropout, convs_per_block=convs_per_block, kernel_size=kernel_size)
+    if "n_termination" in architecture and architecture["n_termination"] != n_termination:
+        raise ValueError("checkpoint architecture.n_termination disagrees with its output heads")
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as error:
+        raise ValueError(f"checkpoint weights disagree with reconstructed architecture: {error}") from error
     model.to(device).eval()
     config = {"features": tuple(features), "history": history, "in_channels": in_ch,
               "n_scalar": n_scalar, "channels": channels, "blocks": blocks,
-              "n_termination": n_termination, "model_type": "five_task" if five_task else "outcome"}
+              "n_termination": n_termination, "model_type": "five_task" if five_task else "outcome",
+              "dropout": dropout, "convs_per_block": convs_per_block, "kernel_size": kernel_size}
     saved = dict(saved)
     saved["inference_config"] = config
     model.inference_config = config

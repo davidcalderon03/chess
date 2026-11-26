@@ -13,6 +13,7 @@ then reloads it and reports test accuracy next to two simple baselines.
 Finally it plots the train/val loss curves, saves them to --plot, and shows the figure.
 """
 import argparse
+import json
 import os
 import random
 import time
@@ -24,38 +25,61 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import LichessPositions, parse_features
+from training_config import parse_with_config
 
 CLASSES = ["white win", "draw", "black win"]
 
 
 class ResBlock(nn.Module):
-    def __init__(self, ch):
+    def __init__(self, ch, convs_per_block=3, kernel_size=3):
         super().__init__()
-        self.c1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        _validate_architecture(ch=ch, convs_per_block=convs_per_block, kernel_size=kernel_size)
+        self.convs_per_block = convs_per_block
+        padding = kernel_size // 2
+        self.c1 = nn.Conv2d(ch, ch, kernel_size, padding=padding, bias=False)
         self.b1 = nn.BatchNorm2d(ch)
-        self.c2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.c2 = nn.Conv2d(ch, ch, kernel_size, padding=padding, bias=False)
         self.b2 = nn.BatchNorm2d(ch)
-        self.c3 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
-        self.b3 = nn.BatchNorm2d(ch)        
+        if convs_per_block == 3:
+            self.c3 = nn.Conv2d(ch, ch, kernel_size, padding=padding, bias=False)
+            self.b3 = nn.BatchNorm2d(ch)
 
     def forward(self, x):
         h = F.relu(self.b1(self.c1(x)))
         h = self.b2(self.c2(h))
-        h = self.b3(self.c3(h))
+        if self.convs_per_block == 3:
+            # Preserve the latest three-convolution block's existing math.
+            h = self.b3(self.c3(h))
         return F.relu(x + h)
 
 
+def _validate_architecture(in_ch=18, ch=128, blocks=6, n_scalar=0,
+                           dropout=.2, convs_per_block=3, kernel_size=3):
+    for name, value, minimum in (("in_ch", in_ch, 1), ("ch", ch, 1),
+                                 ("blocks", blocks, 0), ("n_scalar", n_scalar, 0)):
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+    if type(convs_per_block) is not int or convs_per_block not in (2, 3):
+        raise ValueError("convs_per_block must be 2 or 3")
+    if type(kernel_size) is not int or kernel_size < 1 or kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be a positive odd integer")
+    if type(dropout) not in (int, float) or not np.isfinite(dropout) or not 0 <= dropout <= 1:
+        raise ValueError("dropout must be finite and in [0, 1]")
+
+
 class ChessNet(nn.Module):
-    def __init__(self, in_ch=18, ch=128, blocks=6, n_scalar=0):
+    def __init__(self, in_ch=18, ch=128, blocks=6, n_scalar=0,
+                 dropout=.2, convs_per_block=3, kernel_size=3):
         super().__init__()
+        _validate_architecture(in_ch, ch, blocks, n_scalar, dropout, convs_per_block, kernel_size)
         self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, ch, 3, padding=1, bias=False), nn.BatchNorm2d(ch), nn.ReLU())
-        self.blocks = nn.Sequential(*[ResBlock(ch) for _ in range(blocks)])
+            nn.Conv2d(in_ch, ch, kernel_size, padding=kernel_size // 2, bias=False), nn.BatchNorm2d(ch), nn.ReLU())
+        self.blocks = nn.Sequential(*[ResBlock(ch, convs_per_block, kernel_size) for _ in range(blocks)])
         self.squeeze = nn.Sequential(
             nn.Conv2d(ch, 32, 1, bias=False), nn.BatchNorm2d(32), nn.ReLU())
         self.fc = nn.Sequential(
             nn.Linear(32 * 64 + n_scalar, 256), nn.ReLU(),
-            nn.Dropout(0.2), nn.Linear(256, 3))
+            nn.Dropout(dropout), nn.Linear(256, 3))
 
     def forward(self, x, s):
         h = self.squeeze(self.blocks(self.stem(x))).flatten(1)
@@ -134,22 +158,37 @@ def plot_losses(step_losses, steps_per_epoch, epoch_train, epoch_val, path, show
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(allow_abbrev=False)
+    p.add_argument("--config", help="JSON defaults; explicit CLI options override the file")
+    p.add_argument("--print-config", action="store_true",
+                   help="print resolved JSON settings and exit without loading data or training")
     p.add_argument("--data", default="data")
     p.add_argument("--features", default="board",
                    help="inputs joined by '+': board, skill, time, history (board is always on)")
     p.add_argument("--history", type=int, default=8, help="previous positions used with 'history'")
-    p.add_argument("--use-elo", action="store_true", help="same as adding 'skill' to --features")
+    p.add_argument("--use-elo", action=argparse.BooleanOptionalAction, default=False,
+                   help="same as adding 'skill' to --features")
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--channels", type=int, default=128)
     p.add_argument("--blocks", type=int, default=6)
+    p.add_argument("--convs-per-block", type=int, choices=(2, 3), default=3,
+                   help="2 reproduces the milestone backbone; 3 is the latest architecture")
+    p.add_argument("--kernel-size", type=int, default=3, help="odd kernel size for stem/residual convolutions")
+    p.add_argument("--dropout", type=float, default=.2)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", choices=("adamw", "sgd"), default="adamw")
+    p.add_argument("--momentum", type=float, default=.9, help="constant momentum for SGD; unused by AdamW")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save", default="model.pt")
     p.add_argument("--plot", default="loss_curve.png", help="where to save the loss curve image")
-    p.add_argument("--no-show", action="store_true", help="save the loss curve without opening a window")
+    display = p.add_mutually_exclusive_group()
+    display.add_argument("--no-show", dest="no_show", action="store_true", default=False,
+                         help="save the loss curve without opening a window")
+    display.add_argument("--show", dest="no_show", action="store_false",
+                         help="override no_show=true from JSON")
     p.add_argument("--tasks", choices=("outcome", "all"), default="outcome",
                    help="all trains the five heads; requires shards extracted with --tasks all")
     p.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
@@ -158,20 +197,37 @@ def parse_args(argv=None):
     p.add_argument("--huber-delta", type=float, default=1.)
     p.add_argument("--select-by", choices=("outcome", "total"), default="outcome",
                    help="validation criterion for five-task checkpoint selection")
-    p.add_argument("--skip-test", action="store_true",
+    p.add_argument("--skip-test", action=argparse.BooleanOptionalAction, default=False,
                    help="reserve test evaluation for evaluate.py after model selection")
-    p.add_argument("--quiet", action="store_true",
+    p.add_argument("--quiet", action=argparse.BooleanOptionalAction, default=False,
                    help="suppress progress messages; files are still saved and errors/warnings remain visible")
-    p.add_argument("--augment", action="store_true",
+    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False,
                    help="colour-flip augmentation (five-task training): each training position is "
                         "randomly replaced by its colour-swapped, rank-mirrored equivalent")
-    a = p.parse_args(argv)
+    a = parse_with_config(p, argv)
     if a.augment and a.tasks != "all":
         p.error("--augment is only implemented for --tasks all")
     if a.use_elo:
         a.features += "+skill"
-    a.features = "+".join(parse_features(a.features))
+    try:
+        a.features = "+".join(parse_features(a.features))
+    except ValueError as error:
+        p.error(str(error))
     return a
+
+
+def make_optimizer(model, args):
+    """Shared optimizer construction for the outcome and five-task trainers."""
+    options = dict(lr=args.lr, weight_decay=getattr(args, "weight_decay", 1e-4))
+    if getattr(args, "optimizer", "adamw") == "sgd":
+        return torch.optim.SGD(model.parameters(), momentum=getattr(args, "momentum", .9), **options)
+    return torch.optim.AdamW(model.parameters(), **options)
+
+
+def make_scheduler(optimizer, args, total_steps):
+    # Keep the original AdamW schedule. SGD's configured momentum stays fixed.
+    return torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, total_steps=total_steps,
+        cycle_momentum=getattr(args, "optimizer", "adamw") == "adamw")
 
 
 def seed_everything(seed):
@@ -215,14 +271,15 @@ def run(a):
     test_dl = DataLoader(test_ds, **kw) if test_ds is not None else None
 
     model = ChessNet(in_ch=train_ds.in_channels, ch=a.channels, blocks=a.blocks,
-                     n_scalar=train_ds.n_scalar).to(device)
+                     n_scalar=train_ds.n_scalar, dropout=getattr(a, "dropout", .2),
+                     convs_per_block=getattr(a, "convs_per_block", 3),
+                     kernel_size=getattr(a, "kernel_size", 3)).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     log(f"parameters: {n_params:,}  input planes: {train_ds.in_channels}  "
           f"scalar features: {train_ds.n_scalar}")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=a.lr, total_steps=a.epochs * len(train_dl))
+    opt = make_optimizer(model, a)
+    sched = make_scheduler(opt, a, a.epochs * len(train_dl))
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
@@ -291,7 +348,11 @@ def run(a):
 
 
 def main():
-    run(parse_args())
+    args = parse_args()
+    if args.print_config:
+        print(json.dumps(vars(args), indent=2, sort_keys=True))
+        return
+    run(args)
 
 
 if __name__ == "__main__":

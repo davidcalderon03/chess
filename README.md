@@ -14,6 +14,7 @@ Files:
 - `scoring.py` and `score_position.py` calculate engine–human difficulty gaps for individual positions
 - `bot_baselines.py` compares the five-task model with no-information, Elo, hand-built-feature, Stockfish and (optionally) Maia-2 baselines
 - `requirements.txt` lists the Python dependencies; `tests/` contains optional unit tests
+- `training_config.py` validates reusable JSON training settings in `configs/`
 
 ## 1. Setup
 
@@ -91,6 +92,42 @@ Output flags:
 - `--plot PATH` (default `loss_curve.png`): where the loss-curve image is saved. It is always saved.
 - `--no-show`: don't open the plot in a window. Use it with `nohup`, over SSH, or in scripts, so the run doesn't wait for the window to close.
 
+### Reproducible experiment settings
+
+The latest default backbone has **3 convolutions per residual block**: with 6 blocks it has 20 convolution layers, or 22 convolution/linear layers along one prediction path. The five-task model with `board+skill+time` has **3,212,873 parameters**. The historical milestone/reference-results model used **2 convolutions per block**, giving 14 convolution layers, 16 learned layers per path and **2,326,601 parameters**. Set `--convs-per-block 2` for that architecture; matching its data, labels and original training arguments is still necessary to reproduce its results.
+
+Use JSON when comparing several settings, and CLI options for individual overrides:
+
+```bash
+python train.py --config configs/milestone_2conv.json --print-config
+python train.py --config configs/latest_3conv.json --batch-size 256 \
+  --save checkpoints/latest_batch256.pt --plot reports/latest_batch256.png
+python train.py --config configs/latest_3conv_augmented.json --no-augment \
+  --save checkpoints/latest_without_augmentation.pt
+```
+
+Settings resolve as **built-in defaults < JSON file < explicit CLI options**. `--print-config` prints the complete resolved settings without loading data or using a GPU. JSON keys use underscores (`batch_size`, `convs_per_block`); values use ordinary JSON types, including `true`/`false` for switches. Unknown keys, duplicate keys, wrong types, nonfinite numbers and invalid dimensions fail before training. All paths, including paths inside JSON, are relative to the current working directory, just like CLI paths.
+
+| Setting | Current default | CLI / JSON key |
+|---|---:|---|
+| Residual blocks | 6 | `--blocks` / `blocks` |
+| Convolutions per block | 3; choose 2 for milestone | `--convs-per-block` / `convs_per_block` |
+| Trunk channels | 128 | `--channels` / `channels` |
+| Stem/residual kernel | 3; positive odd sizes | `--kernel-size` / `kernel_size` |
+| Dropout | 0.2 | `--dropout` / `dropout` |
+| Peak OneCycle learning rate | 0.002 | `--lr` / `lr` |
+| Optimizer | `adamw`; also `sgd` | `--optimizer` / `optimizer` |
+| Weight decay | 0.0001 | `--weight-decay` / `weight_decay` |
+| SGD momentum | 0.9, constant; unused by AdamW | `--momentum` / `momentum` |
+| Batch size / epochs | 512 / 5 | `--batch-size`, `--epochs` / `batch_size`, `epochs` |
+| Five-task loss weights | `[1, .5, .25, .25, .1]` | `--task-weights` / `task_weights` |
+| Huber delta | 1 | `--huber-delta` / `huber_delta` |
+| Colour/rank augmentation | false; five-task training only | `--augment`, `--no-augment` / `augment` |
+
+AdamW keeps the existing OneCycleLR schedule, including its beta-1 cycle. SGD uses the same learning-rate schedule with the configured constant momentum. The squeeze width (32), shared dense width (256), stride (1), BatchNorm and existing residual activation placement stay fixed. Both supported block variants retain the latest code's forward equations; the three-convolution block has no extra ReLU between its second and third convolutions.
+
+`configs/milestone_2conv.json`, `configs/latest_3conv.json` and `configs/latest_3conv_augmented.json` provide separate output paths. The historical example selects by outcome loss; the newer examples select by total loss, so align `select_by` before comparing them. All examples reserve test evaluation with `skip_test=true`. Use `--no-skip-test` to override that value, and `--show` to override `no_show=true`. Every checkpoint saves the resolved arguments, the config's absolute path and its SHA-256; five-task histories save the same resolved arguments. Metadata-free legacy two-convolution checkpoints are restored by inspecting their weight tensors.
+
 ## 5. Ablations
 
 `ablate.py` trains the same network on the same positions with different feature sets. It measures how much each factor adds to outcome prediction, extending Anderson, Kleinberg and Mullainathan (KDD 2016) from hand-built features on endgames to learned features on whole games.
@@ -101,6 +138,8 @@ python ablate.py --data data --configs board board+time board+skill board+skill+
 ```
 
 The default configs are cumulative: `board`, `board+skill`, `board+skill+time`, `board+skill+time+history`. Any other `train.py` option (`--epochs`, `--lr`, `--channels`, ...) is passed through.
+
+JSON files pass through too: `python ablate.py --config configs/latest_3conv.json --no-skip-test --out ablations/latest --seeds 0 1 2`. Ablation-controlled feature sets, seeds and output paths override the corresponding JSON defaults. The existing ablation summary requires test metrics, hence the explicit `--no-skip-test` override; use separate `train.py --skip-test` runs when selecting hyperparameters from validation and reserving test evaluation. Use a fresh `--out` when changing training settings; resumption identifies completed rows by feature set and seed.
 
 Outputs in `--out` (default `ablations/`):
 

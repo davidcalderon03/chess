@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 from dataset import parse_features
 from multitask_data import MultiTaskPositions, TERMINATION_CLASSES, training_normalization
 from multitask_model import DEFAULT_WEIGHTS, FiveTaskLoss, MultiTaskChessNet
+from train import make_optimizer, make_scheduler
 
 TASKS = ("outcome", "mistake", "moves", "time", "termination")
 OUTCOME_CLASSES = ("white_win", "draw", "black_win")
@@ -306,16 +307,17 @@ def run_five_task(a):
     criterion = FiveTaskLoss(normalization, weights=weights, delta=delta)
     model = MultiTaskChessNet(in_ch=train_dataset.in_channels, ch=a.channels,
                              blocks=a.blocks, n_scalar=train_dataset.n_scalar,
-                             n_termination=len(TERMINATION_CLASSES)).to(device)
+                             n_termination=len(TERMINATION_CLASSES), dropout=getattr(a, "dropout", .2),
+                             convs_per_block=getattr(a, "convs_per_block", 3),
+                             kernel_size=getattr(a, "kernel_size", 3)).to(device)
     params = sum(parameter.numel() for parameter in model.parameters())
     loader_args = {"batch_size": a.batch_size, "num_workers": a.workers,
                    "pin_memory": device.type == "cuda", "persistent_workers": a.workers > 0}
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False,
                               generator=torch.Generator().manual_seed(a.seed), **loader_args)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=a.lr, total_steps=a.epochs * len(train_loader))
+    optimizer = make_optimizer(model, a)
+    scheduler = make_scheduler(optimizer, a, a.epochs * len(train_loader))
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     manifest_path = Path(a.data).expanduser() / "manifest.json"
@@ -340,6 +342,9 @@ def run_five_task(a):
                 "dataset_manifest_path": str(manifest_path.resolve()) if manifest_hash else None,
                 "architecture": {"in_ch": train_dataset.in_channels, "n_scalar": train_dataset.n_scalar,
                                  "channels": a.channels, "blocks": a.blocks,
+                                 "dropout": getattr(a, "dropout", .2),
+                                 "convs_per_block": getattr(a, "convs_per_block", 3),
+                                 "kernel_size": getattr(a, "kernel_size", 3),
                                  "n_termination": len(TERMINATION_CLASSES)}}
 
     log(f"Device: {device} | Parameters: {params:,} | Inputs: {a.features}")

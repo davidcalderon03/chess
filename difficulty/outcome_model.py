@@ -102,32 +102,48 @@ class ChessNetAdapter(ModelAdapter):
     @classmethod
     def matches(cls, ckpt):
         sd = ckpt.get("model", {})
-        return "stem.0.weight" in sd and "fc.0.weight" in sd
+        return (("stem.0.weight" in sd and "fc.0.weight" in sd)
+                or ("backbone.stem.0.weight" in sd and "heads.outcome.weight" in sd))
 
     @classmethod
     def from_checkpoint(cls, ckpt, device):
-        from train import ChessNet  # imported, not copied
-        a = ckpt.get("args", {})
-        use_elo = bool(a.get("use_elo", ckpt["model"]["fc.0.weight"].shape[1] % 64 == 2))
-        net = ChessNet(ch=a.get("channels", 128), blocks=a.get("blocks", 6), use_elo=use_elo)
-        net.load_state_dict(ckpt["model"])
-        return cls(net.to(device).eval(), device, use_elo)
+        from model_io import reconstruct_checkpoint
+
+        net, saved = reconstruct_checkpoint(ckpt, device)
+        cfg = saved["inference_config"]
+        if cfg["history"] or "time" in cfg["features"]:
+            raise ValueError("The difficulty SampleBatch has no verified clocks/history. "
+                             "Use score_position.py with the required context or an original PGN "
+                             "for time/history-trained checkpoints.")
+        adapter = cls(net, device, "skill" in cfg["features"])
+        adapter.inference_config = cfg
+        return adapter
 
     def predict_white_wdl(self, samples, white_elo, black_elo, context):
         import torch
         from dataset import LichessPositions  # imported, not copied: guarantees identical encoding
         n = len(samples)
         ds = LichessPositions.__new__(LichessPositions)  # shell object holding in-memory arrays
-        ds.bb, ds.meta = samples.bb, samples.meta
+        ds.bb, ds.meta = np.ascontiguousarray(samples.bb, dtype=np.uint64), np.asarray(samples.meta, dtype=np.uint8)
+        if ds.bb.shape != (n, 12) or ds.meta.shape != (n, 7):
+            raise ValueError("SampleBatch must contain bb (N,12) and meta (N,7)")
+        ds.features, ds.history = self.inference_config["features"], 0
         ds.elo = np.stack([white_elo, black_elo], 1).astype(np.int16)
         ds.y = np.zeros(n, np.uint8)
+        ds.scalars = (ds.elo.astype(np.float32) / np.float32(3000.) if self.uses_ratings
+                      else np.zeros((n, 0), dtype=np.float32))
         out = []
         with torch.no_grad():
             for s in range(0, n, 1024):
                 items = [ds[i] for i in range(s, min(n, s + 1024))]
                 x = torch.stack([it[0] for it in items]).to(self.device)
                 elo = torch.stack([it[1] for it in items]).to(self.device)
-                out.append(torch.softmax(self.net(x, elo), dim=1).cpu().numpy())
+                logits = self.net(x, elo)
+                if isinstance(logits, dict):
+                    logits = logits["outcome"]
+                out.append(torch.softmax(logits, dim=1).cpu().numpy())
+        if not out:
+            return np.empty((0, 3), dtype=np.float64), {}
         return np.concatenate(out).astype(np.float64), {}
 
 
@@ -178,7 +194,9 @@ def load_outcome_model(path=None, device=None):
 
 
 def samples_from_boards(boards_and_plies):
-    """Build a SampleBatch from [(chess.Board, ply), ...] using extract.encode."""
+    """Build a SampleBatch with the current extractor's shared encoding helpers."""
     import extract
-    enc = [extract.encode(b, p) for b, p in boards_and_plies]
+    enc = [(extract.bitboards(b), extract.encode_meta(b, p)) for b, p in boards_and_plies]
+    if not enc:
+        return SampleBatch(np.empty((0, 12), np.uint64), np.empty((0, 7), np.uint8))
     return SampleBatch(np.stack([e[0] for e in enc]), np.stack([e[1] for e in enc]))

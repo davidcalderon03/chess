@@ -1,7 +1,7 @@
 /data*
 /reports
 /syzygy
-/__pycache__
+__pycache__/
 /checkpoints
 *.pt
 *.png

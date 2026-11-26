@@ -74,9 +74,9 @@ def decode_sample(bb, meta):
 
 
 def encode_board(board, ply):
-    """Board back to the stored format (delegates to extract.encode so it can never drift)."""
+    """Board back to the stored format using the extractor's shared helpers."""
     import extract
-    return extract.encode(board, ply)
+    return extract.bitboards(board), extract.encode_meta(board, ply)
 
 
 def roundtrip_matches(decoded, bb, meta):

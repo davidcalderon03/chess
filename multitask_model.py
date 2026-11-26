@@ -17,13 +17,15 @@ DEFAULT_WEIGHTS = {"outcome": 1.0, "mistake": 0.5, "moves": 0.25,
 
 
 class MultiTaskChessNet(nn.Module):
-    def __init__(self, in_ch=18, ch=128, blocks=6, n_scalar=0, n_termination=3):
+    def __init__(self, in_ch=18, ch=128, blocks=6, n_scalar=0, n_termination=3,
+                 dropout=.2, convs_per_block=3, kernel_size=3):
         super().__init__()
         if n_scalar < 0 or n_termination < 2:
             raise ValueError("n_scalar must be nonnegative and n_termination at least 2")
         self.n_scalar = n_scalar
         self.in_ch = in_ch
-        self.backbone = ChessNet(in_ch=in_ch, ch=ch, blocks=blocks, n_scalar=n_scalar)
+        self.backbone = ChessNet(in_ch=in_ch, ch=ch, blocks=blocks, n_scalar=n_scalar,
+                                 dropout=dropout, convs_per_block=convs_per_block, kernel_size=kernel_size)
         self.backbone.fc[-1] = nn.Identity()
         self.heads = nn.ModuleDict({
             "outcome": nn.Linear(256, 3),

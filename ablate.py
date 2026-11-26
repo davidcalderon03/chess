@@ -125,15 +125,22 @@ def plot_summary(summary, path, show):
     plt.close(fig)
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", default="data")
+def parse_args(argv=None):
+    # Do not mistake train.py's --config for an abbreviation of --configs.
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                allow_abbrev=False)
+    p.add_argument("--data", default=None,
+                   help="override training data; otherwise use JSON or train.py's default")
     p.add_argument("--configs", nargs="+", default=DEFAULT_CONFIGS,
                    help="feature sets to compare, e.g. board board+skill board+skill+time")
     p.add_argument("--seeds", nargs="+", type=int, default=[0])
     p.add_argument("--out", default="ablations")
     p.add_argument("--no-show", action="store_true", help="save the summary plot without opening a window")
-    a, train_extra = p.parse_known_args()  # anything else (--epochs, --lr, ...) goes to train.py
+    return p.parse_known_args(argv)  # --config, --epochs, --lr, ... go to train.py
+
+
+def main():
+    a, train_extra = parse_args()
 
     configs = ["+".join(parse_features(c)) for c in a.configs]
     os.makedirs(a.out, exist_ok=True)
@@ -147,7 +154,8 @@ def main():
                 continue
             tag = f"{cfg}_s{seed}"
             print(f"\n##### {tag} #####")
-            args = train.parse_args(["--data", a.data, "--features", cfg, "--seed", str(seed),
+            data_args = ["--data", a.data] if a.data is not None else []
+            args = train.parse_args([*data_args, "--features", cfg, "--seed", str(seed),
                                      "--save", os.path.join(a.out, f"{tag}.pt"),
                                      "--plot", os.path.join(a.out, f"{tag}_loss.png"),
                                      "--no-show", *train_extra])
